@@ -46,6 +46,16 @@ Tested package versions include `torch==2.6.0`, `torchvision==0.21.0`,
 Installation usually takes 10-30 minutes on a CUDA Linux workstation, excluding
 large downloads. Training can download UNI2-H through the Hugging Face cache.
 
+### Using `uv`
+
+`pyproject.toml` contains the tested dependencies from above. To install, run:
+
+```bash
+uv sync
+```
+
+Installation with `uv` takes less than 2 minutes.
+
 ## Released Data and Checkpoints
 
 ### Pretrained checkpoints
