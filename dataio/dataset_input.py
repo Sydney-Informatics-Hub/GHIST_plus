@@ -100,8 +100,11 @@ def _as_hwc_uint8(image):
     return np.clip(image, 0, 255).astype(np.uint8, copy=False)
 
 
-def _has_sufficient_tissue(image_hwc, white_threshold=245, min_tissue_fraction=0.02):
-    gray = image_hwc.mean(axis=2)
+def _has_sufficient_tissue(
+    image_hwc, white_threshold=245, min_tissue_fraction=0.02, gray=None
+):
+    if not gray:
+        gray = image_hwc.mean(axis=2)
     tissue_fraction = float(np.mean(gray < white_threshold))
     return tissue_fraction >= min_tissue_fraction
 
@@ -112,8 +115,10 @@ def _has_stable_stain_stats(
     min_tissue_pixels=256,
     min_gray_std=5.0,
     min_channel_std=2.0,
+    gray=None,
 ):
-    gray = image_hwc.mean(axis=2)
+    if not gray:
+        gray = image_hwc.mean(axis=2)
     tissue_mask = gray < white_threshold
     tissue_pixels = image_hwc[tissue_mask]
     if tissue_pixels.shape[0] < min_tissue_pixels:
@@ -161,9 +166,11 @@ def norm_stain(target, to_transform, device, normalizer=None):
     _ = device  # keep signature; normalization happens on CPU
 
     patch_hwc = _as_hwc_uint8(to_transform)
-    if not _has_sufficient_tissue(patch_hwc):
+    # Calculate gray once and reuse in helper functions
+    gray = patch_hwc.mean(axis=2)
+    if not _has_sufficient_tissue(patch_hwc, gray=gray):
         return patch_hwc
-    if not _has_stable_stain_stats(patch_hwc):
+    if not _has_stable_stain_stats(patch_hwc, gray=gray):
         return patch_hwc
 
     if normalizer is None:
