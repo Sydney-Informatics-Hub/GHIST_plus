@@ -535,6 +535,8 @@ def get_input_data(
 
 
 class DataProcessing(data.Dataset):
+    compact_batches = False
+
     def __init__(
         self,
         opts_data_sources,
@@ -599,6 +601,11 @@ class DataProcessing(data.Dataset):
         self.max_cells_per_patch = _resolve_max_cells_per_patch(
             opts_data.max_cells_per_patch
         )
+        # True: __getitem__ returns per-cell tensors with only the real cells
+        # (n_cells rows) and the DataLoader must use dataio.collate's
+        # collate_compact_batch. False (default): every item is padded to
+        # max_cells_per_patch rows, as before.
+        self.compact_batches = bool(getattr(opts_data, "compact_batches", False))
         self.hsize = opts_data.hsize
         self.wsize = opts_data.wsize
         self.opts_data = opts_data
