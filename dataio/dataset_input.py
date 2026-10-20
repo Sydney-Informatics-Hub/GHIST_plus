@@ -873,21 +873,25 @@ class DataProcessing(data.Dataset):
 
         n_cells = len(patch_ids)
 
-        expr_pad = np.zeros((max_cells_per_patch, len(self.gene_names)))
+        # float32 from the start: the gathered rows are already float32, so the
+        # padded block is written once and handed to torch without a dtype copy.
+        pad_rows = n_cells if self.compact_batches else max_cells_per_patch
+        expr_pad = np.zeros((pad_rows, len(self.gene_names)), dtype=np.float32)
         if self.mode != "test":
-            expr = self.df_expr.loc[patch_ids, :].to_numpy()
-            expr_pad[:n_cells, :] = expr.copy()
+            expr_pad[:n_cells, :] = self._expr_f32[self._rows_of(self._expr_index, patch_ids)]
 
-        gt_types_pad = np.zeros(max_cells_per_patch)
+        gt_types_pad = np.zeros(pad_rows, dtype=np.int64)
         if self.comps_celltype and self.mode != "test":
             # cell type labels (previously added 1 to df_ct such that 0 is bkg)
-            gt_types_pad[:n_cells] = self.df_ct.loc[patch_ids, "ct"].to_numpy() - 1
-        gt_types_torch = torch.from_numpy(gt_types_pad).long()
+            gt_types_pad[:n_cells] = (
+                self._ct_values[self._rows_of(self._ct_index, patch_ids)] - 1
+            )
+        gt_types_torch = torch.from_numpy(gt_types_pad)
 
         # cell IDs in patch
-        patch_ids_pad = np.zeros(max_cells_per_patch)
-        patch_ids_pad[:n_cells] = patch_ids.copy()
-        patch_ids_torch = torch.from_numpy(patch_ids_pad).long()
+        patch_ids_pad = np.zeros(pad_rows, dtype=np.int64)
+        patch_ids_pad[:n_cells] = patch_ids
+        patch_ids_torch = torch.from_numpy(patch_ids_pad)
 
         # number of cells in patch
         n_cells = np.array([n_cells])
@@ -916,7 +920,7 @@ class DataProcessing(data.Dataset):
             self.foundation_model_input_normalization,
         )
 
-        expr_torch = torch.from_numpy(expr_pad).float()
+        expr_torch = torch.from_numpy(expr_pad)
 
         return (
             nuclei_torch,
