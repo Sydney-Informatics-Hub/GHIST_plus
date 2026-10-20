@@ -672,6 +672,7 @@ class DataProcessing(data.Dataset):
 
         self.n_patches = len(self.coords_starts)
         self._all_intersect_set = set(self.all_intersect)
+        self._build_lookup_tables()
         self.patch_weights = self._compute_patch_sampling_weights(
             immune_sampler_boost
         )
@@ -708,6 +709,52 @@ class DataProcessing(data.Dataset):
                 _as_hwc_uint8(self.stain_ref)
             )
         return self._stain_normalizer
+
+    def _build_lookup_tables(self):
+        """Dense numpy tables so __getitem__ never builds sets or uses DataFrame.loc.
+
+        * ``_valid_ids_sorted``: sorted int64 ids of eligible cells, queried with
+          ``np.searchsorted`` (the old code rebuilt ``set(self.all_intersect)`` per
+          patch ~ 10^5 elements on large slides).
+        * ``_ct_index``/``_ct_values``: cell-type label by id (``df_ct["ct"]``).
+        * ``_expr_index``/``_expr_f32``: C-contiguous float32 copy of ``df_expr``.
+          The old path gathered rows with ``df_expr.loc`` into float64 and
+          converted to float32 afterwards; float64->float32 rounding is the same
+          either way, so the values are identical. ``df_expr``/``df_ct`` stay on the
+          object for callers outside this class.
+        """
+        self._valid_ids_sorted = np.sort(np.asarray(self.all_intersect, dtype=np.int64))
+        self._ct_index = self._ct_values = None
+        if self.df_ct is not None and "ct" in self.df_ct.columns:
+            self._ct_index = self.df_ct.index
+            self._ct_values = np.ascontiguousarray(self.df_ct["ct"].to_numpy())
+        self._expr_index = self._expr_f32 = None
+        if self.df_expr is not None:
+            self._expr_index = self.df_expr.index
+            self._expr_f32 = np.ascontiguousarray(
+                self.df_expr.to_numpy(), dtype=np.float32
+            )
+        # Build the pandas hash tables now, in the parent, so DataLoader workers
+        # inherit them instead of each rebuilding them on first use.
+        for index in (self._ct_index, self._expr_index):
+            if index is not None and len(index):
+                index.get_indexer(index[:1])
+
+    def _is_valid_cell(self, ids):
+        """Boolean mask: which of ``ids`` are eligible cells (``all_intersect``)."""
+        table = self._valid_ids_sorted
+        if table.size == 0 or ids.size == 0:
+            return np.zeros(ids.shape, dtype=bool)
+        pos = np.searchsorted(table, ids)
+        pos[pos == table.size] = 0
+        return table[pos] == ids
+
+    @staticmethod
+    def _rows_of(index, ids):
+        rows = index.get_indexer(ids)
+        if (rows < 0).any():
+            raise KeyError(f"cell ids not found: {np.asarray(ids)[rows < 0][:5].tolist()}")
+        return rows
 
     def _truncate_patch_ids(self, patch_ids, max_cells_per_patch, hs, ws):
         if len(patch_ids) <= max_cells_per_patch:
@@ -772,23 +819,29 @@ class DataProcessing(data.Dataset):
         hist_patch = np.nan_to_num(hist_patch, nan=0.0, posinf=255.0, neginf=0.0)
         hist_patch = np.clip(hist_patch, 0.0, 255.0)
 
-        ids_seg = np.unique(nuclei_patch)
-        ids_seg = ids_seg[ids_seg != 0]
+        # One sort of the patch gives the unique ids and, via the inverse, a
+        # per-pixel index into them, so cell eligibility and cell-type labels are
+        # applied as lookup tables over the (few) unique ids instead of one
+        # full-patch pass per id.
+        uniq, inverse = np.unique(nuclei_patch, return_inverse=True)
+        inverse = inverse.reshape(nuclei_patch.shape)
+        nonzero = uniq != 0
+        valid = np.zeros(uniq.shape, dtype=bool)
+        valid[nonzero] = self._is_valid_cell(uniq[nonzero])
 
-        # make sure cells have valid data
-        valid_ids = list(set(ids_seg) & set(self.all_intersect))
-        invalid_ids = list(set(ids_seg) - set(valid_ids))
-        dictionary = dict(zip(invalid_ids, [0] * len(invalid_ids)))
-        nuclei_valid = np.copy(nuclei_patch)
-        for k, v in dictionary.items():
-            nuclei_valid[nuclei_patch == k] = v
+        # make sure cells have valid data (ineligible cells become background)
+        if np.array_equal(valid, nonzero):
+            nuclei_valid = nuclei_patch
+        else:
+            nuclei_valid = np.where(valid, uniq, 0).astype(uniq.dtype)[inverse]
+        valid_ids = uniq[valid]
 
         if self.comps_celltype and self.mode != "test":
             # map to cell type nuclei map
-            dictionary = dict(zip(valid_ids, self.df_ct.loc[valid_ids, "ct"].tolist()))
-            types_patch = np.copy(nuclei_valid)
-            for k, v in dictionary.items():
-                types_patch[nuclei_valid == k] = v
+            ct_lut = np.zeros(uniq.shape, dtype=uniq.dtype)
+            if valid_ids.size:
+                ct_lut[valid] = self._ct_values[self._rows_of(self._ct_index, valid_ids)]
+            types_patch = ct_lut[inverse]
         else:
             types_patch = np.where(nuclei_valid > 0, 1, 0)
 
@@ -807,8 +860,8 @@ class DataProcessing(data.Dataset):
         else:
             hist_patch = hist_patch.astype(np.float32, copy=False)
 
-        patch_ids = np.unique(nuclei_valid)
-        patch_ids = patch_ids[patch_ids != 0]
+        # unique eligible ids in the patch, ascending (== unique(nuclei_valid) \ {0})
+        patch_ids = valid_ids
 
         max_cells_per_patch = self.max_cells_per_patch
         patch_ids = self._truncate_patch_ids(
